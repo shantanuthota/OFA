@@ -42,6 +42,9 @@ logger = logging.getLogger("onion-forecast-api")
 MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-2")
 QUANTILES = [0.1, 0.5, 0.9]
 ALLOWED_HORIZONS = (7, 14, 30, 60, 90)
+# Graph 1 configuration
+AP_MODEL_CONTEXT_YEARS = 3 
+AP_DISPLAY_HISTORY_MONTHS = 3
 CALENDAR_COLUMNS = ["month", "day_of_week", "day_of_year_sin", "day_of_year_cos"]
 
 app = FastAPI(
@@ -329,53 +332,148 @@ def sync_csv_endpoint(
 
 
 @app.get("/api/graphs/ap-retail")
+
+@app.get("/api/graphs/ap-retail")
 def ap_retail_graph(
-    horizon_days: int = Query(14, ge=7, le=90, description="Forecast horizon: 7, 14, 30, 60, or 90 days"),
-    history_days: int = Query(365, ge=30, le=2000, description="Both model context and displayed historical window in days"),
-    price_types: str = Query("retail", description="Comma-separated values: retail, wholesale"),
+    horizon_days: int = Query(
+        14,
+        description="Forecast horizon: 7, 14, 30, 60, or 90 days",
+    ),
+    price_types: str = Query(
+        "retail",
+        description="Comma-separated values: retail, wholesale",
+    ),
 ) -> dict:
-    """Graph 1: AP retail and/or mandi modal prices, with selected context window."""
+    """
+    Graph 1:
+    - Chronos-2 always receives the latest 3 years of history.
+    - The graph displays only the last 6 calendar months of actual prices.
+    - Forecast horizon is independently selectable.
+    """
     data = get_data()
-    selected_types = [x.lower() for x in _parse_list(price_types, {"RETAIL", "WHOLESALE"}, "price types")]
-    cutoff = pd.Timestamp(data["timestamp"].max()).normalize() - pd.Timedelta(days=history_days - 1)
-    context = data.loc[data["timestamp"] >= cutoff].copy()
+    selected_types = [
+        x.lower()
+        for x in _parse_list(
+            price_types,
+            {"RETAIL", "WHOLESALE"},
+            "price types",
+        )
+    ]
+
+    # Ensure timestamps are consistently represented as datetimes.
+    data = data.copy()
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    data = data.sort_values("timestamp")
+
+    latest_date = pd.Timestamp(data["timestamp"].max()).normalize()
+
+    # 1. MODEL CONTEXT: latest 3 years.
+    # This entire filtered dataset is passed into Chronos-2.
+    model_cutoff = latest_date - pd.DateOffset(
+        years=AP_MODEL_CONTEXT_YEARS
+    )
+
+    context = data.loc[
+        data["timestamp"] >= model_cutoff
+    ].copy()
+
     if context.empty:
-        raise HTTPException(status_code=422, detail="No observations found in the selected historical window.")
-    targets = [PRICE_COLUMNS["AP"][t] for t in selected_types]
-    prediction = _predict(context, target=targets, horizon_days=horizon_days)
-    target_map = {PRICE_COLUMNS["AP"][t]: t for t in selected_types}
+        raise HTTPException(
+            status_code=422,
+            detail="No observations available for the 3-year model context.",
+        )
+
+    # 2. DISPLAY HISTORY: latest 6 calendar months.
+    # This dataset is used only for the actual-price lines in the graph.
+    display_cutoff = latest_date - pd.DateOffset(
+        months=AP_DISPLAY_HISTORY_MONTHS
+    )
+
+    visible_history = data.loc[
+        data["timestamp"] >= display_cutoff
+    ].copy()
+
+    # 3. Forecast using the full 3-year model context.
+    _validate_horizon(horizon_days)
+
+    targets = [
+        PRICE_COLUMNS["AP"][price_type]
+        for price_type in selected_types
+    ]
+
+    prediction = _predict(
+        context,
+        target=targets,
+        horizon_days=horizon_days,
+    )
+
+    target_map = {
+        PRICE_COLUMNS["AP"][price_type]: price_type
+        for price_type in selected_types
+    }
+
     forecast = []
+
     for _, row in prediction.iterrows():
         target_name = str(row["target_name"])
+
         if target_name not in target_map:
             continue
+
         price_type = target_map[target_name]
-        point = _series_point(row, value_key="predicted_price_rs_kg")
+        point = _series_point(
+            row,
+            value_key="predicted_price_rs_kg",
+        )
+
         forecast.append({
             "date": point["date"],
             "state": "AP",
             "price_type": price_type,
-            "price_type_label": "Retail price" if price_type == "retail" else "Mandi modal price",
+            "price_type_label": (
+                "Retail price"
+                if price_type == "retail"
+                else "Mandi modal price"
+            ),
             "predicted_price_rs_kg": point["predicted_price_rs_kg"],
             "p10_rs_kg": point["p10"],
             "p90_rs_kg": point["p90"],
-            "prediction_interval_width_rs_kg": point["prediction_interval_width"],
-            "interval_width_pct_of_median": point["interval_width_pct_of_median"],
+            "prediction_interval_width_rs_kg": (
+                point["prediction_interval_width"]
+            ),
+            "interval_width_pct_of_median": (
+                point["interval_width_pct_of_median"]
+            ),
         })
+
+    # 4. Build actual historical chart points using only the
+    # visible six-month window, not the full model context.
     historical = []
+
     for price_type in selected_types:
         target_col = PRICE_COLUMNS["AP"][price_type]
-        for row in context[["timestamp", target_col]].itertuples(index=False):
+
+        for row in visible_history[
+            ["timestamp", target_col]
+        ].itertuples(index=False):
+
             value = getattr(row, target_col)
+
             if pd.notna(value):
                 historical.append({
                     "date": row.timestamp.date().isoformat(),
                     "state": "AP",
                     "price_type": price_type,
-                    "price_type_label": "Retail price" if price_type == "retail" else "Mandi modal price",
+                    "price_type_label": (
+                        "Retail price"
+                        if price_type == "retail"
+                        else "Mandi modal price"
+                    ),
                     "actual_price_rs_kg": round(float(value), 4),
                 })
+
     status = _data_status(data)
+
     return {
         "graph": "ap_price_forecast",
         "title": "Andhra Pradesh Onion Retail and Mandi Modal Price Forecast",
@@ -384,14 +482,30 @@ def ap_retail_graph(
         "selected_price_types": selected_types,
         "unit": "INR/kg",
         "horizon_days": horizon_days,
-        "history_days": history_days,
+
+        # Explicitly distinguish model history from chart history.
+        "model_context_years": AP_MODEL_CONTEXT_YEARS,
         "model_context_days": len(context),
+        "model_context_start_date": (
+            context["timestamp"].min().date().isoformat()
+        ),
+        "model_context_end_date": (
+            context["timestamp"].max().date().isoformat()
+        ),
+        "display_history_months": AP_DISPLAY_HISTORY_MONTHS,
+        "display_history_start_date": (
+            visible_history["timestamp"].min().date().isoformat()
+            if not visible_history.empty
+            else None
+        ),
+
         "historical": historical,
         "forecast": forecast,
         "metadata": _metadata(),
         **status,
         "forecast_end_date": forecast[-1]["date"] if forecast else None,
     }
+
 
 
 @app.get("/api/graphs/state-comparison")

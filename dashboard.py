@@ -97,23 +97,57 @@ tab1, tab2, tab3 = st.tabs([
 with tab1:
     st.subheader("Andhra Pradesh retail price forecast")
     c1, c2 = st.columns([1, 2])
+    
     with c1:
-        horizon1 = st.selectbox("Forecast horizon", HORIZONS, index=1, key="g1_horizon", format_func=lambda n: f"{n} days")
-        history_options = {"1 year (365 days)": 365, "3 years (1,095 days)": 1095, "5 years / all available data": 1826}
-        history_label = st.selectbox("Historical window AND model context", list(history_options), index=0, key="g1_history")
-        history1 = history_options[history_label]
-        selected_ap_types = st.multiselect("AP price series", ["retail", "wholesale"], default=["retail"], format_func=lambda x: "Retail price" if x == "retail" else "Mandi modal price", key="g1_types")
-        run1 = st.button("Generate AP forecast", type="primary", key="g1_run")
+        horizon1 = st.selectbox(
+            "Forecast horizon",
+            HORIZONS,
+            index=1,
+            key="g1_horizon",
+            format_func=lambda n: f"{n} days",
+        )
+
+        # st.info(
+        #     "Model context: latest 3 years of available data. "
+        #     "Historical graph: last 6 calendar months."
+        # )
+
+        selected_ap_types = st.multiselect(
+            "AP price series",
+            ["retail", "wholesale"],
+            default=["retail"],
+            format_func=lambda x: (
+                "Retail price"
+                if x == "retail"
+                else "Mandi modal price"
+            ),
+            key="g1_types",
+        )
+
+        run1 = st.button(
+            "Generate AP forecast",
+            type="primary",
+            key="g1_run",
+        )
+
     with c2:
         st.markdown("Forecast line: **P50** · Shaded band: **P10–P90 nominal 80% prediction interval**")
-        st.caption("The selected historical window is used both for the visible history and as Chronos-2's input context. Five years means all available history if the dataset contains fewer than five years.")
+        st.caption(
+            "Chronos-2 receives the latest 3 years of available history. "
+            "Only the last 6 calendar months of actual prices are displayed. "
+            "The forecast horizon controls how many future days are predicted."
+        )
     if run1:
         with st.spinner("Running Chronos-2 for AP retail prices. First run may download model weights..."):
             try:
                 if not selected_ap_types:
                     raise ValueError("Select at least one AP price series.")
                 st.session_state["graph1_payload"] = fetch_graph(
-                    "/api/graphs/ap-retail", {"horizon_days": horizon1, "history_days": history1, "price_types": ",".join(selected_ap_types)}
+                    "/api/graphs/ap-retail",
+                    {
+                        "horizon_days": horizon1,
+                        "price_types": ",".join(selected_ap_types),
+                    },
                 )
                 st.session_state["graph1_error"] = None
             except Exception as exc:
@@ -149,7 +183,15 @@ with tab1:
             met1.metric(f"First {metric_label} forecast (P50)", f"₹{latest['predicted_price_rs_kg']:.2f}/kg")
             met2.metric("P10 lower bound", f"₹{latest['p10_rs_kg']:.2f}/kg")
             met3.metric("P90 upper bound", f"₹{latest['p90_rs_kg']:.2f}/kg")
-            st.caption(f"Chronos-2 context: {payload.get('model_context_days')} daily observations available in the selected historical window.")
+            st.caption(
+                f"Chronos-2 model context: "
+                f"{payload.get('model_context_days')} daily observations "
+                f"from {payload.get('model_context_start_date')} "
+                f"to {payload.get('model_context_end_date')}. "
+                f"Historical chart starts on "
+                f"{payload.get('display_history_start_date')} "
+                f"and shows the last 6 calendar months."
+            )
             with st.expander("Forecast rows"):
                 st.dataframe(pred, use_container_width=True)
             st.download_button("Download forecast CSV", pred.to_csv(index=False), file_name=f"ap_price_forecast_{payload['horizon_days']}d.csv", mime="text/csv")
